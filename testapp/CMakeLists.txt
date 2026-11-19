@@ -6,7 +6,6 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# ImGui sources
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/imgui)
 set(IMGUI_SOURCES
   ${IMGUI_DIR}/imgui.cpp

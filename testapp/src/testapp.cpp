@@ -30,6 +30,11 @@
 #include <iomanip>
 #include <string>
 #include <functional>
+#include <set>
+#include <ctime>
+#include <cstdio>
+#include <cctype>
+#include <cmath>
 
 #include "JoyConDecoder.h"
 #include "DsuServer.h"
@@ -48,6 +53,13 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363;
 const std::vector<uint8_t> JOYCON_MANUFACTURER_PREFIX = { 0x01, 0x00, 0x03, 0x7E };
+
+
+
+const wchar_t* SESSION_CHAR_UUID       = L"00c5af5d-1964-4e30-8f51-1956f96bd282";
+const wchar_t* NATIVE_INPUT_UUID_R     = L"d5a9e01e-2ffc-4cca-b20c-8b67142bf442";
+const wchar_t* NATIVE_INPUT_UUID_L     = L"cc1bbbb5-7354-4d32-a716-a81cb241a32a";
+const wchar_t* NATIVE_ENABLE_DESC_UUID = L"679d5510-5a24-4dee-9557-95df80486ecb";
 const wchar_t* INPUT_REPORT_UUID  = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 const wchar_t* WRITE_COMMAND_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
 
@@ -69,6 +81,20 @@ const wchar_t* VIBRATION_CHAR_UUID_PRO = L"cc483f51-9258-427d-a939-630c31f72b05"
 const wchar_t* VIBRATION_CHAR_UUID_GC  = L"3f8fb670-ab25-45bf-b540-38c72834d064";
 
 const std::string CONFIG_FILE = "joycon2cpp_config.json";
+
+
+
+enum class DeviceKind { Any, JoyConL, JoyConR, Pro, GC };
+
+
+
+constexpr uint16_t PID_JOYCON_R = 0x2066;
+constexpr uint16_t PID_JOYCON_L = 0x2067;
+constexpr uint16_t PID_PRO      = 0x2069;
+constexpr uint16_t PID_GC       = 0x2073;
+
+
+constexpr size_t FULL_REPORT_LEN = 0x3C;
 
 enum class UpdatePolicy { LowLatency, Balanced120Hz, Legacy60Hz };
 enum ControllerType { SingleJoyCon = 1, DualJoyCon = 2, ProController = 3, NSOGCController = 4 };
@@ -111,6 +137,40 @@ struct PlayerConfig {
     RemapSideways  remapSideways     = RemapSideways::No; 
 };
 
+
+struct RxStats {
+    std::string           label;
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> fullCount{0};
+    std::atomic<uint32_t> lastLen{0};
+    std::mutex            mtx;
+    std::vector<uint8_t>  lastPacket;
+    std::vector<uint8_t>  lastButtons;
+    int                   changeLogs = 0;
+    std::vector<uint8_t>  lastLoggedPkt;
+    std::chrono::steady_clock::time_point lastLogTime{};
+    int                   logLines = 0;
+    bool                  captureFlag = false;
+    std::atomic<uint64_t> nonZeroMask{0};
+};
+
+
+struct FauxGyroSettings {
+    std::atomic<bool> enabled{true};
+    std::atomic<bool> invX{false}, invY{false}, invZ{false};
+    std::atomic<int>  gainPercent{100};
+    std::atomic<int>  dualSource{1};
+};
+static FauxGyroSettings g_fg;
+
+struct FauxGyroState {
+    std::mutex mtx;
+    bool       hasQuat = false;
+    uint16_t   prevTs = 0;
+    float      prevQ[4] = { 1.f, 0.f, 0.f, 0.f };
+    float      out[3] = { 0.f, 0.f, 0.f };
+};
+
 struct ConnectedJoyCon {
     BluetoothLEDevice      device    = nullptr;
     GattCharacteristic     inputChar = nullptr;
@@ -121,6 +181,16 @@ struct ConnectedJoyCon {
     GattCharacteristic     vibrationCharRight = nullptr;
     GattCharacteristic     cmdRespBasicChar = nullptr;
     GattCharacteristic     cmdRespExtChar = nullptr;
+    GattCharacteristic     sessionChar = nullptr;
+    GattCharacteristic     nativeInputChar = nullptr;
+    std::shared_ptr<RxStats> nativeRx;
+    bool                   consoleMode = false;
+    std::shared_ptr<FauxGyroState> fg;
+    std::shared_ptr<RxStats> rx;
+    std::vector<std::pair<GattCharacteristic, std::shared_ptr<RxStats>>> extraInputs;
+    uint64_t               address   = 0;
+    uint16_t               productId = 0;
+    std::string            initStrategy;
 };
 
 using SteadyClock = std::chrono::steady_clock;
@@ -227,6 +297,9 @@ static std::vector<DualRumbleCtx*>   g_dualRumbleCtxs;
 static std::vector<SingleRumbleCtx*> g_proRumbleCtxs;
 
 static std::vector<ConnectionTask>  g_connectionTasks;
+static std::mutex                   g_connMutex;
+static std::vector<std::shared_ptr<RxStats>> g_rxStats;
+static std::mutex                   g_rxStatsMutex;
 static int                          g_connectionTaskIndex = 0;
 static bool                         g_connectionDone      = false;
 static std::string                  g_connectionError;
@@ -240,10 +313,79 @@ static std::atomic<bool> g_shuttingDown{false};
 
 static std::mutex         g_logMutex;
 static std::vector<std::string> g_logLines;
+static std::atomic<uint64_t> g_logVersion{0};
 static void AppLog(const std::string& s) {
     std::lock_guard<std::mutex> lk(g_logMutex);
     g_logLines.push_back(s);
     if (g_logLines.size() > 200) g_logLines.erase(g_logLines.begin());
+    ++g_logVersion;
+}
+
+
+
+static std::mutex    g_diagMutex;
+static std::ofstream g_diagFile;
+static bool          g_diagOpened = false;
+static void DiagLog(const std::string& s) {
+    {
+        std::lock_guard<std::mutex> lk(g_diagMutex);
+        if (!g_diagOpened) {
+            g_diagOpened = true;
+            g_diagFile.open("joycon2cpp_debug.log", std::ios::out | std::ios::trunc);
+        }
+        if (g_diagFile.is_open()) {
+            std::time_t t = std::time(nullptr);
+            std::tm tmv{};
+            localtime_s(&tmv, &t);
+            char ts[16] = {};
+            std::strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+            g_diagFile << ts << "  " << s << "\n";
+            g_diagFile.flush();
+        }
+    }
+    AppLog(s);
+}
+
+
+static std::atomic<bool> g_capActive{false};
+static std::mutex        g_capMutex;
+static std::ofstream     g_capFile;
+static std::chrono::steady_clock::time_point g_capStart;
+static std::atomic<int>  g_capSecondsLeft{0};
+
+static void CapWrite(const std::string& label, const std::vector<uint8_t>& buf) {
+    std::lock_guard<std::mutex> lk(g_capMutex);
+    if (!g_capFile.is_open()) return;
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_capStart).count();
+    char head[64];
+    sprintf_s(head, "%7lld ms  len=%3u  ", ms, (unsigned)buf.size());
+    g_capFile << head << label << " :";
+    for (uint8_t b : buf) { char t[8]; sprintf_s(t, " %02X", b); g_capFile << t; }
+    g_capFile << "\n";
+}
+
+static void CapStart(int seconds) {
+    if (g_capActive.load()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_capMutex);
+        if (g_capFile.is_open()) g_capFile.close();
+        g_capFile.open("joycon2cpp_motion_capture.txt", std::ios::out | std::ios::trunc);
+        g_capStart = std::chrono::steady_clock::now();
+    }
+    g_capSecondsLeft.store(seconds);
+    g_capActive.store(true);
+    DiagLog("Motion capture started (" + std::to_string(seconds) + " s) -> joycon2cpp_motion_capture.txt");
+    std::thread([seconds]() {
+        for (int i = seconds; i > 0 && !g_shuttingDown.load(); --i) {
+            g_capSecondsLeft.store(i);
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        g_capActive.store(false);
+        g_capSecondsLeft.store(0);
+        { std::lock_guard<std::mutex> lk(g_capMutex); if (g_capFile.is_open()) g_capFile.close(); }
+        DiagLog("Motion capture finished: joycon2cpp_motion_capture.txt");
+    }).detach();
 }
 
 class LatencyCsvLogger {
@@ -400,32 +542,59 @@ static std::string HexBytes(const std::vector<uint8_t>& bytes) {
     return hex;
 }
 
-static void AttachCommandResponseLogger(
+static std::string GuidStr(guid const& g) {
+    std::string out = winrt::to_string(winrt::to_hstring(g));
+    for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+static std::string PropsStr(uint32_t p) {
+    std::string s;
+    if (p & 0x02) s += "Read ";
+    if (p & 0x04) s += "WriteNoResp ";
+    if (p & 0x08) s += "Write ";
+    if (p & 0x10) s += "Notify ";
+    if (p & 0x20) s += "Indicate ";
+    if (s.empty()) s = "-";
+    return s;
+}
+
+static const char* GattStatusName(GattCommunicationStatus st) {
+    switch (st) {
+        case GattCommunicationStatus::Success:       return "Success";
+        case GattCommunicationStatus::Unreachable:   return "Unreachable";
+        case GattCommunicationStatus::ProtocolError: return "ProtocolError";
+        case GattCommunicationStatus::AccessDenied:  return "AccessDenied";
+        default:                                     return "Unknown";
+    }
+}
+
+static void AttachPacketTap(GattCharacteristic const& inputChar, std::shared_ptr<RxStats> rx);
+
+
+
+static std::shared_ptr<RxStats> AttachCommandResponseLogger(
     GattCharacteristic const& ch,
     const std::string& name,
     GattClientCharacteristicConfigurationDescriptorValue cccValue =
         GattClientCharacteristicConfigurationDescriptorValue::Notify)
 {
     if (!ch) {
-        return;
+        return nullptr;
     }
 
-    ch.ValueChanged([name](GattCharacteristic const&, GattValueChangedEventArgs const& args) {
-        if (g_shuttingDown.load()) return;
-        auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
-        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
-        rdr.ReadBytes(buf);
-
-
-        if (buf.size() >= 8) {
-            char tmp[160];
-            sprintf_s(tmp,"[CMDRESP] parsed cmd=0x%02X sub=0x%02X ack0=0x%02X ack1=0x%02X transport=0x%02X",buf[0], buf[3], buf[4], buf[5], buf[2]);
-        }
-    });
+    auto rx = std::make_shared<RxStats>();
+    rx->label = name;
+    rx->captureFlag = (name.find("cmd-resp(basic)") != std::string::npos);
+    { std::lock_guard<std::mutex> lk(g_rxStatsMutex); g_rxStats.push_back(rx); }
+    AttachPacketTap(ch, rx);
 
     try {
         auto status = ch.WriteClientCharacteristicConfigurationDescriptorAsync(cccValue).get();
+        if (status != GattCommunicationStatus::Success)
+            DiagLog("[WARN] could not subscribe to " + name + ": " + GattStatusName(status));
     } catch (...) { }
+    return rx;
 }
 
 static void SendGenericCommand(GattCharacteristic const& ch, uint8_t cmdId, uint8_t subId, const std::vector<uint8_t>& data) {
@@ -493,112 +662,312 @@ static void SendCustomCommands(GattCharacteristic const& ch) {
 }
 
 
-static void Send0016Command(GattCharacteristic const& ch, const std::vector<uint8_t>& cmd,
-                             int prefixSize = 17)
+static const char* KindNameForLog(DeviceKind k)
 {
-    if (!ch || g_shuttingDown.load()) return;
-
-    std::vector<uint8_t> pkt(prefixSize, 0x00);
-    pkt.insert(pkt.end(), cmd.begin(), cmd.end());
-
-    DataWriter w;
-    w.WriteBytes(pkt);
-    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse);
+    switch (k) {
+        case DeviceKind::JoyConL: return "Left Joy-Con";
+        case DeviceKind::JoyConR: return "Right Joy-Con";
+        case DeviceKind::Pro:     return "Pro Controller";
+        case DeviceKind::GC:      return "NSO GC Controller";
+        default:                  return "Controller";
+    }
 }
 
+using Cmd = std::vector<uint8_t>;
 
-static void SendJoyCon2OfficialInit(GattCharacteristic const& ch)
+
+static std::vector<Cmd> JoyCon2InitCmds()
 {
-    if (!ch || g_shuttingDown.load()) return;
-
-    std::vector<std::vector<uint8_t>> cmds = {
+    return {
         {0x07,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
         {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x00,0x30,0x01,0x00},
         {0x10,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
         {0x16,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
-        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},                     
-        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 
-        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},                     
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00}, 
+        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},
+        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00},
         {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x10,0x7E,0x00,0x00,0x40,0x30,0x01,0x00},
         {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x18,0x7E,0x00,0x00,0x00,0x31,0x01,0x00},
         {0x11,0x91,0x01,0x03,0x00,0x00,0x00,0x00},
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x20,0x7E,0x00,0x00,0x60,0x30,0x01,0x00}, 
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x20,0x7E,0x00,0x00,0x60,0x30,0x01,0x00},
         {0x0A,0x91,0x01,0x08,0x00,0x14,0x00,0x00,
          0x01,0x59,0x09,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0x35,0x00,0x46,
-         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                                        
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
         {0x11,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
-        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},                   
+        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},
     };
-
-    for (auto& cmd : cmds) {
-        Send0016Command(ch, cmd, 17); 
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    }
 }
 
-static void SendProCon2OfficialInit(GattCharacteristic const& ch)
+static std::vector<Cmd> ProCon2InitCmds()
 {
-    if (!ch || g_shuttingDown.load()) return;
-
-    std::vector<std::vector<uint8_t>> cmds = {
+    return {
         {0x07,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
         {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x00,0x30,0x01,0x00},
         {0x16,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
-        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},                     
-        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},  
-        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x2F,0x00,0x00,0x00},                 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0xC0,0x30,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x10,0x7E,0x00,0x00,0x40,0x30,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x18,0x7E,0x00,0x00,0x00,0x31,0x01,0x00}, 
+        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},
+        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x2F,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0xC0,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x10,0x7E,0x00,0x00,0x40,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x18,0x7E,0x00,0x00,0x00,0x31,0x01,0x00},
         {0x11,0x91,0x01,0x03,0x00,0x00,0x00,0x00},
         {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x20,0x7E,0x00,0x00,0x60,0x30,0x01,0x00},
         {0x0A,0x91,0x01,0x08,0x00,0x14,0x00,0x00,
          0x01,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x35,0x00,0x46,
-         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                                         
-        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x2F,0x00,0x00,0x00},                 
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x2F,0x00,0x00,0x00},
     };
+}
 
-    for (auto& cmd : cmds) {
-        Send0016Command(ch, cmd, 33);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+static std::vector<Cmd> NSOGCInitCmds()
+{
+    return {
+        {0x07,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x00,0x30,0x01,0x00},
+        {0x10,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+        {0x16,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},
+        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x27,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0xC0,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x10,0x7E,0x00,0x00,0x40,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x18,0x7E,0x00,0x00,0x00,0x31,0x01,0x00},
+        {0x11,0x91,0x01,0x03,0x00,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x02,0x7E,0x00,0x00,0x40,0x31,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x20,0x7E,0x00,0x00,0x60,0x30,0x01,0x00},
+        {0x0A,0x91,0x01,0x08,0x00,0x14,0x00,0x00,
+         0x01,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x35,0x00,0x46,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x27,0x00,0x00,0x00},
+    };
+}
+
+
+static void ApplyFeatureMask(std::vector<Cmd>& cmds, uint8_t mask)
+{
+    for (auto& c : cmds)
+        if (c.size() >= 9 && c[0] == 0x0C && c[1] == 0x91) c[8] = mask;
+}
+
+
+
+static bool GattWrite(GattCharacteristic const& ch, const std::vector<uint8_t>& pkt,
+                      GattCommunicationStatus* outStatus = nullptr)
+{
+    if (!ch) return false;
+    const uint32_t props = static_cast<uint32_t>(ch.CharacteristicProperties());
+    const GattWriteOption opt = (props & 0x04) ? GattWriteOption::WriteWithoutResponse
+                                               : GattWriteOption::WriteWithResponse;
+    try {
+        DataWriter w;
+        w.WriteBytes(pkt);
+        GattCommunicationStatus st = ch.WriteValueAsync(w.DetachBuffer(), opt).get();
+        if (outStatus) *outStatus = st;
+        return st == GattCommunicationStatus::Success;
+    } catch (...) {
+        if (outStatus) *outStatus = GattCommunicationStatus::Unreachable;
+        return false;
     }
 }
 
 
-static void SendNSOGCOfficialInit(GattCharacteristic const& ch)
+
+
+static int RunInitCommands(GattCharacteristic const& ch, const std::vector<Cmd>& cmds,
+                           size_t prefixSize, const std::string& tag)
 {
-    if (!ch || g_shuttingDown.load()) return;
-
-    std::vector<std::vector<uint8_t>> cmds = {
-        {0x07,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x00,0x30,0x01,0x00}, 
-        {0x10,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
-        {0x16,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
-        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},                    
-        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x27,0x00,0x00,0x00},                    
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0xC0,0x30,0x01,0x00},
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00},
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x10,0x7E,0x00,0x00,0x40,0x30,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x18,0x7E,0x00,0x00,0x00,0x31,0x01,0x00}, 
-        {0x11,0x91,0x01,0x03,0x00,0x00,0x00,0x00},
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x02,0x7E,0x00,0x00,0x40,0x31,0x01,0x00}, 
-        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x20,0x7E,0x00,0x00,0x60,0x30,0x01,0x00},
-        {0x0A,0x91,0x01,0x08,0x00,0x14,0x00,0x00,
-         0x01,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x35,0x00,0x46,
-         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},                                        
-        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x27,0x00,0x00,0x00},                    
-    };
-
-    for (auto& cmd : cmds) {
-        Send0016Command(ch, cmd, 13); 
+    int okCount = 0, failCount = 0;
+    for (const auto& cmd : cmds) {
+        if (g_shuttingDown.load()) break;
+        std::vector<uint8_t> pkt(prefixSize, 0x00);
+        pkt.insert(pkt.end(), cmd.begin(), cmd.end());
+        GattCommunicationStatus st = GattCommunicationStatus::Unreachable;
+        if (GattWrite(ch, pkt, &st)) {
+            ++okCount;
+        } else {
+            ++failCount;
+            if (failCount <= 2) DiagLog(tag + ": write failed (" + GattStatusName(st) + ")");
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
     }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    DiagLog(tag + ": " + std::to_string(okCount) + " commands written, " + std::to_string(failCount) + " failed");
+    return okCount;
+}
+
+static bool WaitForFullStream(const std::shared_ptr<RxStats>& rx, uint64_t fullBefore, int waitMs)
+{
+    const auto end = SteadyClock::now() + std::chrono::milliseconds(waitMs);
+    while (SteadyClock::now() < end && !g_shuttingDown.load()) {
+        if (rx->fullCount.load() >= fullBefore + 3) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return rx->fullCount.load() >= fullBefore + 3;
+}
+
+
+
+
+static bool TryConsoleSession(ConnectedJoyCon& cj, DeviceKind kind,
+                              const std::function<void(const std::string&)>& statusCb)
+{
+    if (!cj.nativeInputChar || !cj.nativeRx) return false;
+    const std::string tag = std::string("[CONSOLE ") + KindNameForLog(kind) + "]";
+    statusCb("Switching to console protocol (clone pad)...");
+    DiagLog(tag + " standard input is silent - starting console-protocol session on the native input characteristic");
+
+
+    if (cj.sessionChar) {
+        std::vector<uint8_t> en = { 0x01, 0x00 };
+        GattCommunicationStatus st = GattCommunicationStatus::Unreachable;
+        const bool ok = GattWrite(cj.sessionChar, en, &st);
+        DiagLog(tag + " session enable (01 00): " + (ok ? "ok" : GattStatusName(st)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } else {
+        DiagLog(tag + " [WARN] session characteristic (...bd282) not found, skipping");
+    }
+
+
+    {
+        std::vector<Cmd> cmds = JoyCon2InitCmds();
+        if (cj.rumbleChar)      RunInitCommands(cj.rumbleChar, cmds, 17, tag + " commands");
+        else if (cj.writeChar)  RunInitCommands(cj.writeChar,  cmds, 0,  tag + " commands");
+    }
+
+
+    try {
+        auto dr = cj.nativeInputChar.GetDescriptorsForUuidAsync(guid(NATIVE_ENABLE_DESC_UUID), BluetoothCacheMode::Uncached).get();
+        if (dr.Status() == GattCommunicationStatus::Success && dr.Descriptors().Size() > 0) {
+            std::vector<uint8_t> val = { 0x85, 0x00 };
+            DataWriter w;
+            w.WriteBytes(val);
+            GattCommunicationStatus st = dr.Descriptors().GetAt(0).WriteValueAsync(w.DetachBuffer()).get();
+            DiagLog(tag + " native enable descriptor (85 00): " + GattStatusName(st));
+        } else {
+            DiagLog(tag + " [WARN] native enable descriptor not found (status " + GattStatusName(dr.Status()) + ")");
+        }
+    } catch (...) {
+        DiagLog(tag + " [WARN] writing the native enable descriptor threw an exception");
+    }
+
+
+    GattCommunicationStatus cst = GattCommunicationStatus::Unreachable;
+    for (int i = 0; i < 3; ++i) {
+        try {
+            cst = cj.nativeInputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
+                      GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+        } catch (...) {
+            cst = GattCommunicationStatus::Unreachable;
+        }
+        if (cst == GattCommunicationStatus::Success) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    DiagLog(tag + " native input notifications: " + GattStatusName(cst));
+
+
+    const uint64_t before = cj.nativeRx->count.load();
+    const auto end = SteadyClock::now() + std::chrono::milliseconds(2500);
+    while (SteadyClock::now() < end && !g_shuttingDown.load()) {
+        if (cj.nativeRx->count.load() >= before + 3) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if (cj.nativeRx->count.load() >= before + 3) {
+        cj.inputChar    = cj.nativeInputChar;
+        cj.rx           = cj.nativeRx;
+        cj.consoleMode  = true;
+        cj.initStrategy = "console protocol (native input)";
+        DiagLog(tag + " OK - native input is streaming (" + std::to_string(cj.nativeRx->count.load()) + " packets)");
+        cj.fg = std::make_shared<FauxGyroState>();
+        return true;
+    }
+    DiagLog(tag + " no packets on the native input characteristic");
+    return false;
+}
+
+struct InitAttempt {
+    const char* name;
+    int         channel;
+    size_t      prefix;
+    uint8_t     mask;
+};
+
+
+
+
+
+
+
+
+static bool ActivateInputStream(ConnectedJoyCon& cj, DeviceKind kind,
+                                const std::function<void(const std::string&)>& statusCb)
+{
+    if (!cj.rx) return false;
+    const bool joyLike = (kind == DeviceKind::JoyConL || kind == DeviceKind::JoyConR || kind == DeviceKind::Any);
+    const size_t combinedPrefix = (kind == DeviceKind::Pro) ? 33 : (kind == DeviceKind::GC) ? 13 : 17;
+
+    std::vector<InitAttempt> attempts;
+    if (cj.rumbleChar) attempts.push_back({ "original (0x0016 combined)", 1, combinedPrefix, 0 });
+    if (cj.writeChar)  attempts.push_back({ "direct (0x0014 command)",    0, 0, 0 });
+    if (cj.writeChar) {
+        if (joyLike) {
+            attempts.push_back({ "direct, features 0xFF", 0, 0, 0xFF });
+            attempts.push_back({ "direct, features 0x2F", 0, 0, 0x2F });
+        } else {
+            attempts.push_back({ "direct, features 0x2F", 0, 0, 0x2F });
+            attempts.push_back({ "direct, features 0xFF", 0, 0, 0xFF });
+        }
+    }
+    if (attempts.empty()) {
+        DiagLog("[ERROR] no writable command characteristic found - cannot initialise controller");
+        return false;
+    }
+
+    bool consoleTried = false;
+    for (const auto& a : attempts) {
+        if (g_shuttingDown.load()) return false;
+        std::vector<Cmd> cmds = (kind == DeviceKind::Pro) ? ProCon2InitCmds()
+                              : (kind == DeviceKind::GC)  ? NSOGCInitCmds()
+                                                          : JoyCon2InitCmds();
+        if (a.mask) ApplyFeatureMask(cmds, a.mask);
+
+        const std::string tag = std::string("[INIT ") + KindNameForLog(kind) + " / " + a.name + "]";
+        statusCb(std::string("Initialising (") + a.name + ")...");
+        DiagLog(tag + " sending " + std::to_string(cmds.size()) + " commands");
+
+        const uint64_t fullBefore = cj.rx->fullCount.load();
+        RunInitCommands(a.channel == 1 ? cj.rumbleChar : cj.writeChar, cmds, a.prefix, tag);
+
+        if (WaitForFullStream(cj.rx, fullBefore, 1500)) {
+            cj.initStrategy = a.name;
+            DiagLog(tag + " OK - controller is streaming input reports");
+            return true;
+        }
+        DiagLog(tag + " no full-size input stream yet (packets so far: " +
+                std::to_string(cj.rx->count.load()) + ", last length: " +
+                std::to_string(cj.rx->lastLen.load()) + ")");
+
+
+        if (!consoleTried && joyLike && cj.nativeInputChar) {
+            consoleTried = true;
+            if (TryConsoleSession(cj, kind, statusCb)) return true;
+        }
+    }
+
+    if (cj.rx->count.load() > 0) {
+        DiagLog("[WARN] " + std::string(KindNameForLog(kind)) + " sends packets but none are 60+ bytes (last length " +
+                std::to_string(cj.rx->lastLen.load()) + "). Buttons may still work; motion data will not.");
+        return true;
+    }
+    DiagLog("[WARN] " + std::string(KindNameForLog(kind)) + " connected but sent NO input packets after every init strategy. "
+            "See joycon2cpp_debug.log (GATT dump + command responses).");
+    return false;
 }
 
 static void SendRumble(GattCharacteristic const& ch, float amp)
@@ -737,38 +1106,335 @@ static void StartDualRumbleThread(DualRumbleCtx* ctx) {
 }
 
 
+
+
+
 static bool TryParseSwitch2ControllerAd(const std::vector<uint8_t>& d, uint16_t& productId)
 {
-    if (d.size() < 7) return false;
-    if (d[0] != 0x01 || d[1] != 0x00 || d[2] != 0x03) return false;
-    if (d[3] != 0x7E || d[4] != 0x05) return false;
-
-    productId = static_cast<uint16_t>(d[5] | (static_cast<uint16_t>(d[6]) << 8));
-    return productId >= 0x2060;
+    productId = 0;
+    if (d.size() < 4) return false;
+    if (d[0] != 0x01 || d[1] != 0x00 || d[2] != 0x03 || d[3] != 0x7E) return false;
+    if (d.size() >= 7 && d[4] == 0x05)
+        productId = static_cast<uint16_t>(d[5] | (static_cast<uint16_t>(d[6]) << 8));
+    return true;
 }
 
-static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess, JoyConSide side = JoyConSide::Left) {
+static bool NameLooksLikeSwitchController(const std::string& nameIn)
+{
+    std::string n = nameIn;
+    for (auto& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return n.find("joy-con") != std::string::npos || n.find("joycon") != std::string::npos ||
+           n.find("pro controller") != std::string::npos || n.find("mobapad") != std::string::npos ||
+           n.find("nintendo") != std::string::npos;
+}
+
+
+
+static bool PidMatchesKind(uint16_t pid, DeviceKind kind)
+{
+    const bool known = (pid == PID_JOYCON_R || pid == PID_JOYCON_L || pid == PID_PRO || pid == PID_GC);
+    if (!known || kind == DeviceKind::Any) return true;
+    switch (kind) {
+        case DeviceKind::JoyConL: return pid == PID_JOYCON_L;
+        case DeviceKind::JoyConR: return pid == PID_JOYCON_R;
+        case DeviceKind::Pro:     return pid == PID_PRO;
+        case DeviceKind::GC:      return pid == PID_GC;
+        default:                  return true;
+    }
+}
+
+
+
+static std::mutex         g_connectedAddrMutex;
+static std::set<uint64_t> g_connectedAddrs;
+static void MarkConnectedAddr(uint64_t a)  { std::lock_guard<std::mutex> lk(g_connectedAddrMutex); g_connectedAddrs.insert(a); }
+static bool IsConnectedAddr(uint64_t a)    { std::lock_guard<std::mutex> lk(g_connectedAddrMutex); return g_connectedAddrs.count(a) != 0; }
+static void ClearConnectedAddrs()          { std::lock_guard<std::mutex> lk(g_connectedAddrMutex); g_connectedAddrs.clear(); }
+
+struct BleCandidate {
+    uint64_t    address   = 0;
+    uint16_t    productId = 0;
+    int16_t     rssi      = 0;
+    std::string name;
+};
+
+
+struct WatcherGuard {
+    BluetoothLEAdvertisementWatcher& watcher;
+    event_token                      token;
+    bool                             active;
+    WatcherGuard(BluetoothLEAdvertisementWatcher& w, event_token t) : watcher(w), token(t), active(true) {}
+    ~WatcherGuard() { Release(); }
+    void Release() {
+        if (!active) return;
+        active = false;
+        try { watcher.Stop(); } catch (...) {}
+        try { watcher.Received(token); } catch (...) {}
+    }
+};
+
+
+
+static void AttachPacketTap(GattCharacteristic const& inputChar, std::shared_ptr<RxStats> rx)
+{
+    inputChar.ValueChanged([rx](GattCharacteristic const&, GattValueChangedEventArgs const& args) {
+        if (g_shuttingDown.load()) return;
+        auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
+        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
+        rdr.ReadBytes(buf);
+
+        if (g_capActive.load() && rx->captureFlag) {
+
+            if (rx->label.find("cmd-resp") == std::string::npos || (!buf.empty() && buf[0] == 0xEA))
+                CapWrite(rx->label, buf);
+        }
+
+        {
+            uint64_t m = 0;
+            const size_t lim = std::min<size_t>(buf.size(), 64);
+            for (size_t i = 0; i < lim; ++i) if (buf[i]) m |= (1ULL << i);
+            rx->nonZeroMask.fetch_or(m);
+        }
+
+        const uint64_t n = ++rx->count;
+        rx->lastLen.store(static_cast<uint32_t>(buf.size()));
+        if (buf.size() >= FULL_REPORT_LEN) ++rx->fullCount;
+
+
+
+        bool logIt = false;
+        {
+            std::lock_guard<std::mutex> lk(rx->mtx);
+            rx->lastPacket = buf;
+            const auto nowT = std::chrono::steady_clock::now();
+            bool differs = (buf.size() != rx->lastLoggedPkt.size());
+            if (!differs) {
+                for (size_t i = 4; i < buf.size(); ++i)
+                    if (buf[i] != rx->lastLoggedPkt[i]) { differs = true; break; }
+            }
+            if (n <= 3) logIt = true;
+            else if (differs && rx->logLines < 300 &&
+                     nowT - rx->lastLogTime >= std::chrono::milliseconds(100)) logIt = true;
+            if (logIt) {
+                rx->lastLoggedPkt = buf;
+                rx->lastLogTime = nowT;
+                ++rx->logLines;
+            }
+        }
+        if (logIt) {
+            const size_t k = std::min<size_t>(buf.size(), 40);
+            std::vector<uint8_t> head(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(k));
+            DiagLog("[RX " + rx->label + " #" + std::to_string(n) + "] len=" +
+                    std::to_string(buf.size()) + " " + HexBytes(head));
+        }
+    });
+}
+
+
+
+static bool TryOpenController(const BleCandidate& cand, JoyConSide side, DeviceKind kind,
+                              const std::function<void(const std::string&)>& statusCb,
+                              ConnectedJoyCon& cj)
+{
+    cj = ConnectedJoyCon{};
+    BluetoothLEDevice device = nullptr;
+    try {
+        device = BluetoothLEDevice::FromBluetoothAddressAsync(cand.address).get();
+    } catch (...) {
+        DiagLog("[WARN] BluetoothLEDevice::FromBluetoothAddressAsync threw an exception");
+        return false;
+    }
+    if (!device) {
+        DiagLog("[WARN] BLE device opened as null");
+        return false;
+    }
+    cj.device = device;
+    statusCb("Device opened, fetching GATT services...");
+
+    GattDeviceServicesResult sr = nullptr;
+    for (int att = 1; att <= 6; ++att) {
+        if (g_shuttingDown.load()) break;
+        try {
+            sr = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
+        } catch (...) {
+            sr = nullptr;
+        }
+        if (sr && sr.Status() == GattCommunicationStatus::Success) break;
+        statusCb("Retrying GATT (" + std::to_string(att) + "/6)...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    if (!sr || sr.Status() != GattCommunicationStatus::Success) {
+        DiagLog("[WARN] could not read GATT services (is this pad in pairing mode? remove it from Windows Bluetooth devices if listed)");
+        try { device.Close(); } catch (...) {}
+        cj = ConnectedJoyCon{};
+        return false;
+    }
+
+    std::vector<GattCharacteristic> extraNotifyChars;
+    for (auto svc : sr.Services()) {
+        const std::string svcStr = GuidStr(svc.Uuid());
+        const bool isStandardService = svcStr.find("-0000-1000-8000-00805f9b34fb") != std::string::npos;
+        DiagLog("[GATT] service " + svcStr);
+
+        GattCharacteristicsResult cr = nullptr;
+        try { cr = svc.GetCharacteristicsAsync(BluetoothCacheMode::Uncached).get(); } catch (...) { continue; }
+        if (!cr || cr.Status() != GattCommunicationStatus::Success) continue;
+
+        for (auto ch : cr.Characteristics()) {
+            const uint32_t props = static_cast<uint32_t>(ch.CharacteristicProperties());
+            char hbuf[16];
+            sprintf_s(hbuf, "0x%04X", static_cast<unsigned>(ch.AttributeHandle()));
+            DiagLog(std::string("[GATT]   char handle ") + hbuf + "  " + GuidStr(ch.Uuid()) + "  [" + PropsStr(props) + "]");
+
+            bool known = false;
+            if (ch.Uuid() == guid(INPUT_REPORT_UUID))  { cj.inputChar  = ch; known = true; }
+            if (ch.Uuid() == guid(WRITE_COMMAND_UUID)) { cj.writeChar  = ch; known = true; }
+            if (ch.Uuid() == guid(SESSION_CHAR_UUID))  { cj.sessionChar = ch; known = true; }
+            if (ch.Uuid() == guid(NATIVE_INPUT_UUID_R)) { known = true; if (side == JoyConSide::Right) cj.nativeInputChar = ch; }
+            if (ch.Uuid() == guid(NATIVE_INPUT_UUID_L)) { known = true; if (side == JoyConSide::Left)  cj.nativeInputChar = ch; }
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_BASIC)) { cj.cmdRespBasicChar = ch; known = true; }
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_L))   { known = true; if (side == JoyConSide::Left)  cj.cmdRespExtChar = ch; }
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_R))   { known = true; if (side == JoyConSide::Right) cj.cmdRespExtChar = ch; }
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_PRO)) { cj.cmdRespExtChar = ch; known = true; }
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_GC))  { cj.cmdRespExtChar = ch; known = true; }
+            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_L))   { known = true; if (side == JoyConSide::Left)  cj.rumbleChar = ch; }
+            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_R))   { known = true; if (side == JoyConSide::Right) cj.rumbleChar = ch; }
+            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_PRO)) { cj.rumbleChar = ch; known = true; }
+            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_GC))  { cj.rumbleChar = ch; known = true; }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_L)) {
+                known = true;
+                cj.vibrationCharLeft = ch;
+                if (side == JoyConSide::Left) cj.vibrationChar = ch;
+            }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_R)) {
+                known = true;
+                cj.vibrationCharRight = ch;
+                if (side == JoyConSide::Right) cj.vibrationChar = ch;
+            }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_PRO)) { cj.vibrationChar = ch; known = true; }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_GC))  { cj.vibrationChar = ch; known = true; }
+
+
+
+            if (!known && !isStandardService && (props & 0x10)) extraNotifyChars.push_back(ch);
+        }
+    }
+
+    if (!cj.inputChar || (!cj.writeChar && !cj.rumbleChar)) {
+        DiagLog("[ERROR] required GATT characteristics not found (input report / command). See the [GATT] lines above.");
+        statusCb("Required GATT characteristics not found. Re-pair/forget the device.");
+        try { device.Close(); } catch (...) {}
+        cj = ConnectedJoyCon{};
+        return false;
+    }
+    DiagLog(std::string("[GATT] summary: input=") + (cj.inputChar ? "yes" : "NO") +
+            " command(0x0014)=" + (cj.writeChar ? "yes" : "NO") +
+            " rumble+command(0x0016)=" + (cj.rumbleChar ? "yes" : "NO") +
+            " hd-rumble(0x0012)=" + (cj.vibrationChar ? "yes" : "NO"));
+
+    cj.address   = cand.address;
+    cj.productId = cand.productId;
+    cj.rx = std::make_shared<RxStats>();
+    cj.rx->label = KindNameForLog(kind);
+    { std::lock_guard<std::mutex> lk(g_rxStatsMutex); g_rxStats.push_back(cj.rx); }
+
+
+    AttachPacketTap(cj.inputChar, cj.rx);
+    auto chLabel = [&](const char* what, GattCharacteristic const& c) {
+        char hb[16];
+        sprintf_s(hb, "0x%04X", static_cast<unsigned>(c.AttributeHandle()));
+        return std::string(KindNameForLog(kind)) + " " + what + " h=" + hb;
+    };
+    if (cj.nativeInputChar) {
+        cj.nativeRx = std::make_shared<RxStats>();
+        cj.nativeRx->label = chLabel("native-input", cj.nativeInputChar);
+        cj.nativeRx->captureFlag = true;
+        { std::lock_guard<std::mutex> lk(g_rxStatsMutex); g_rxStats.push_back(cj.nativeRx); }
+        AttachPacketTap(cj.nativeInputChar, cj.nativeRx);
+    }
+    if (cj.cmdRespBasicChar) AttachCommandResponseLogger(cj.cmdRespBasicChar, chLabel("cmd-resp(basic)", cj.cmdRespBasicChar));
+    if (cj.cmdRespExtChar)   AttachCommandResponseLogger(cj.cmdRespExtChar,   chLabel("cmd-resp(ext)",   cj.cmdRespExtChar));
+    for (auto& ec : extraNotifyChars) {
+        auto erx = AttachCommandResponseLogger(ec, chLabel("vendor", ec) + " " + GuidStr(ec.Uuid()).substr(1, 8));
+        if (erx) cj.extraInputs.push_back({ ec, erx });
+    }
+
+    try {
+        cj.device.RequestPreferredConnectionParameters(BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+    } catch (...) {}
+
+    {
+        const uint32_t ip = static_cast<uint32_t>(cj.inputChar.CharacteristicProperties());
+        const GattClientCharacteristicConfigurationDescriptorValue cccVal =
+            (ip & 0x10) ? GattClientCharacteristicConfigurationDescriptorValue::Notify :
+            (ip & 0x20) ? GattClientCharacteristicConfigurationDescriptorValue::Indicate :
+                          GattClientCharacteristicConfigurationDescriptorValue::Notify;
+        GattCommunicationStatus cccSt = GattCommunicationStatus::Unreachable;
+        for (int i = 0; i < 3; ++i) {
+            try {
+                cccSt = cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(cccVal).get();
+            } catch (...) {
+                cccSt = GattCommunicationStatus::Unreachable;
+            }
+            if (cccSt == GattCommunicationStatus::Success) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        DiagLog(std::string("[GATT] input report notifications: ") + GattStatusName(cccSt));
+        if (cccSt != GattCommunicationStatus::Success)
+            DiagLog("[WARN] could not enable input notifications - the pad may require Windows-level Bluetooth pairing first");
+    }
+
+    statusCb("Connected, starting input stream...");
+    ActivateInputStream(cj, kind, statusCb);
+
+
+
+    if (cj.rx && cj.rx->count.load() == 0) {
+        for (auto& e : cj.extraInputs) {
+            if (e.second && e.second->fullCount.load() >= 3) {
+                DiagLog("[WARN] no packets on the standard input characteristic, but '" + e.second->label +
+                        "' streams full-size reports - using it for input");
+                cj.inputChar = e.first;
+                cj.rx = e.second;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+
+
+
+static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess,
+                                  JoyConSide side = JoyConSide::Left, DeviceKind kind = DeviceKind::Any) {
     outSuccess = false;
     ConnectedJoyCon cj{};
-    BluetoothLEDevice device = nullptr;
+    const std::string kindName = KindNameForLog(kind);
 
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool found = false;
-    uint64_t foundAddress = 0;
-    uint16_t foundProductId = 0;
-    int16_t foundRssi = 0;
+
+
+    struct ScanState {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::vector<BleCandidate> pending;
+        std::map<uint64_t, TimePoint> cooldownUntil;
+        std::set<uint64_t> loggedAddrs;
+    };
+    auto st = std::make_shared<ScanState>();
 
     BluetoothLEAdvertisementWatcher watcher;
     watcher.ScanningMode(BluetoothLEScanningMode::Passive);
-    auto token = watcher.Received([&](auto const&, auto const& args) {
+    auto token = watcher.Received([st, kind, kindName](auto const&, auto const& args) {
         if (g_shuttingDown.load()) return;
 
         uint16_t productId = 0;
         bool match = false;
+        std::string localName;
 
         try {
-            auto mfg = args.Advertisement().ManufacturerData();
+            auto adv = args.Advertisement();
+            auto mfg = adv.ManufacturerData();
             for (uint32_t i = 0; i < mfg.Size(); i++) {
                 auto sec = mfg.GetAt(i);
                 if (sec.CompanyId() != JOYCON_MANUFACTURER_ID) continue;
@@ -782,125 +1448,113 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
                     break;
                 }
             }
+            if (!match) {
+                localName = winrt::to_string(adv.LocalName());
+                if (!localName.empty() && NameLooksLikeSwitchController(localName)) match = true;
+            }
         } catch (...) {
             return;
         }
 
         if (!match) return;
 
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            if (found) return;
-            found = true;
-            foundAddress = args.BluetoothAddress();
-            foundProductId = productId;
-            foundRssi = args.RawSignalStrengthInDBm();
-        }
-        cv.notify_one();
-    });
+        const uint64_t addr = args.BluetoothAddress();
+        if (IsConnectedAddr(addr)) return;
 
-    statusCb("Scanning... (hold sync button)");
+        char abuf[40];
+        sprintf_s(abuf, "%012llX", static_cast<unsigned long long>(addr));
+
+        if (!PidMatchesKind(productId, kind)) {
+            bool first = false;
+            { std::lock_guard<std::mutex> lk(st->mtx); first = st->loggedAddrs.insert(addr).second; }
+            if (first) {
+                char tmp[160];
+                sprintf_s(tmp, "Ignoring controller %s (PID 0x%04X) - not a %s", abuf, (unsigned)productId, kindName.c_str());
+                DiagLog(tmp);
+            }
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(st->mtx);
+            auto cd = st->cooldownUntil.find(addr);
+            if (cd != st->cooldownUntil.end() && SteadyClock::now() < cd->second) return;
+            for (const auto& p : st->pending) if (p.address == addr) return;
+            BleCandidate c;
+            c.address   = addr;
+            c.productId = productId;
+            c.rssi      = args.RawSignalStrengthInDBm();
+            c.name      = localName;
+            st->pending.push_back(c);
+        }
+        st->cv.notify_one();
+    });
+    WatcherGuard guard(watcher, token);
+
+    statusCb("Scanning for " + kindName + "... hold its sync button");
+    DiagLog("Scanning for " + kindName + " (hold its sync button)");
     try {
         watcher.Start();
     } catch (...) {
-        statusCb("BLE scan failed to start");
+        statusCb("BLE scan failed to start (is Bluetooth turned on?)");
         return cj;
     }
 
-    {
-        std::unique_lock<std::mutex> lk(mtx);
-        if (!cv.wait_for(lk, std::chrono::seconds(30), [&]{ return found || g_shuttingDown.load(); })) {
-            watcher.Stop();
-            watcher.Received(token);
-            statusCb("Timed out — device not found");
-            return cj;
+    const auto deadline = SteadyClock::now() + std::chrono::seconds(60);
+    bool connected = false;
+    while (!connected && !g_shuttingDown.load() && SteadyClock::now() < deadline) {
+        BleCandidate cand;
+        {
+            std::unique_lock<std::mutex> lk(st->mtx);
+            st->cv.wait_for(lk, std::chrono::milliseconds(500), [&]{ return !st->pending.empty() || g_shuttingDown.load(); });
+            if (st->pending.empty()) continue;
+            cand = st->pending.front();
+            st->pending.erase(st->pending.begin());
         }
-    }
 
-    watcher.Stop();
-    watcher.Received(token);
-
-    if (g_shuttingDown.load()) {
-        statusCb("Cancelled");
-        return cj;
-    }
-
-    {
-        char tmp[160];
-        sprintf_s(tmp, "Found advertisement PID 0x%04X RSSI %d, opening device...", foundProductId, (int)foundRssi);
-        statusCb(tmp);
-    }
-
-    try {
-        device = BluetoothLEDevice::FromBluetoothAddressAsync(foundAddress).get();
-    } catch (...) {
-        statusCb("Failed to open BLE device");
-        return cj;
-    }
-
-    if (!device) {
-        statusCb("BLE device opened as null");
-        return cj;
-    }
-
-    statusCb("Device opened, fetching GATT services...");
-    cj.device = device;
-
-    GattDeviceServicesResult sr = nullptr;
-    for (int att = 1; att <= 10; ++att) {
-        sr = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
-        if (sr.Status() == GattCommunicationStatus::Success) break;
-        statusCb("Retrying GATT (" + std::to_string(att) + "/10)...");
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    if (!sr || sr.Status() != GattCommunicationStatus::Success) {
-        statusCb("Failed to get GATT services. Re-pair/forget the device.");
-        return cj;
-    }
-    for (auto svc : sr.Services()) {
-        auto cr = svc.GetCharacteristicsAsync().get();
-        if (cr.Status() != GattCommunicationStatus::Success) continue;
-        for (auto ch : cr.Characteristics()) {
-            if (ch.Uuid() == guid(INPUT_REPORT_UUID))  cj.inputChar  = ch;
-            if (ch.Uuid() == guid(WRITE_COMMAND_UUID)) cj.writeChar  = ch;
-            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_BASIC)) cj.cmdRespBasicChar = ch;
-            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_L))   { if (side == JoyConSide::Left)  cj.cmdRespExtChar = ch; }
-            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_R))   { if (side == JoyConSide::Right) cj.cmdRespExtChar = ch; }
-            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_PRO)) cj.cmdRespExtChar = ch;
-            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_GC))  cj.cmdRespExtChar = ch; 
-            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_L))   { if (side == JoyConSide::Left)  cj.rumbleChar = ch; }
-            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_R))   { if (side == JoyConSide::Right) cj.rumbleChar = ch; }
-            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_PRO)) cj.rumbleChar = ch;
-            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_GC))  cj.rumbleChar = ch;
-            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_L)) {
-                cj.vibrationCharLeft = ch;
-                if (side == JoyConSide::Left) cj.vibrationChar = ch;
-            }
-            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_R)) {
-                cj.vibrationCharRight = ch;
-                if (side == JoyConSide::Right) cj.vibrationChar = ch;
-            }
-            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_PRO)) {
-                cj.vibrationChar = ch;
-            }
-            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_GC)) {
-                cj.vibrationChar = ch;
-            }
+        {
+            char tmp[200];
+            sprintf_s(tmp, "Found %s (addr %012llX, PID 0x%04X, RSSI %d), connecting...",
+                      kindName.c_str(), static_cast<unsigned long long>(cand.address),
+                      (unsigned)cand.productId, (int)cand.rssi);
+            statusCb(tmp);
+            DiagLog(tmp);
         }
+
+        if (TryOpenController(cand, side, kind, statusCb, cj)) {
+            connected = true;
+            break;
+        }
+
+
+
+        {
+            std::lock_guard<std::mutex> lk(st->mtx);
+            st->cooldownUntil[cand.address] = SteadyClock::now() + std::chrono::seconds(4);
+        }
+        statusCb("That device didn't work - still scanning for " + kindName + " (hold its sync button)");
     }
-    if (!cj.inputChar || !cj.writeChar) {
-        statusCb("Required GATT characteristics not found. Re-pair/forget the device.");
+    guard.Release();
+
+    if (!connected) {
+        cj = ConnectedJoyCon{};
+        if (g_shuttingDown.load()) statusCb("Cancelled");
+        else statusCb("Timed out - no " + kindName + " connected within 60 s");
+        DiagLog("[ERROR] could not connect " + kindName);
         return cj;
     }
 
-    AttachCommandResponseLogger(cj.cmdRespBasicChar, "basic 0x001A");
-    AttachCommandResponseLogger(cj.cmdRespExtChar, "extended 0x001E");
-    try {
-        cj.device.RequestPreferredConnectionParameters(BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
-    } catch(...) {}
+    MarkConnectedAddr(cj.address);
     outSuccess = true;
+    DiagLog(kindName + " connected" + (cj.initStrategy.empty() ? std::string(" (no confirmed input stream yet)")
+                                                               : " via init strategy: " + cj.initStrategy));
     statusCb("Connected!");
     return cj;
+}
+
+static void SetTaskStatus(int idx, const std::string& msg) {
+    std::lock_guard<std::mutex> lk(g_connMutex);
+    if (idx >= 0 && idx < (int)g_connectionTasks.size()) g_connectionTasks[idx].statusMsg = msg;
 }
 
 static void InitViGEm() {
@@ -1039,6 +1693,195 @@ static void UpdateCalibLiveValues() {
     }
 }
 
+
+
+
+
+
+static void M12ProQuatToGyro(FauxGyroState& st, const std::vector<uint8_t>& buf, size_t base, float outDps[3])
+{
+    std::lock_guard<std::mutex> lk(st.mtx);
+    outDps[0] = outDps[1] = outDps[2] = 0.f;
+
+    if (buf.size() < base + 17 || buf[base + 3] != 0x0C) return;
+
+    const uint16_t ts12 = static_cast<uint16_t>(((buf[base + 1] & 0x0F) << 8) | buf[base]);
+    const uint8_t idx = buf[base + 4] & 0x03;
+
+    auto rd32 = [](const uint8_t* p) -> uint32_t {
+        return static_cast<uint32_t>(p[0])
+            | (static_cast<uint32_t>(p[1]) << 8)
+            | (static_cast<uint32_t>(p[2]) << 16)
+            | (static_cast<uint32_t>(p[3]) << 24);
+    };
+    const uint8_t* m = &buf[base + 5];
+    const uint32_t w0 = rd32(m + 0);
+    const uint32_t w1 = rd32(m + 4);
+    const uint32_t w2 = rd32(m + 8);
+
+    const uint32_t f0 = (w0 >> 1) & 0x01FFFFFFu;
+    const uint32_t f1 = w1 & 0x01FFFFFFu;
+    const uint32_t f2 = ((w2 << 1) | (w1 >> 31)) & 0x01FFFFFFu;
+
+    constexpr float kScale = 16777216.0f * 1.41421356237f;
+    const float v0 = (static_cast<int32_t>(f0) - 0x01000000) / kScale;
+    const float v1 = (static_cast<int32_t>(f1) - 0x01000000) / kScale;
+    const float v2 = (static_cast<int32_t>(f2) - 0x01000000) / kScale;
+    const float sumSq = v0 * v0 + v1 * v1 + v2 * v2;
+    if (sumSq > 1.05f) return;
+    const float d = std::sqrt(std::max(0.0f, 1.0f - sumSq));
+
+    float q[4];
+    switch (idx) {
+        case 0:  q[0] = d;  q[1] = v0; q[2] = v1; q[3] = v2; break;
+        case 1:  q[0] = v2; q[1] = d;  q[2] = v0; q[3] = v1; break;
+        case 2:  q[0] = v1; q[1] = v2; q[2] = d;  q[3] = v0; break;
+        default: q[0] = v0; q[1] = v1; q[2] = v2; q[3] = d;  break;
+    }
+
+    if (!st.hasQuat) {
+        st.hasQuat = true;
+        st.prevTs = ts12;
+        for (int i = 0; i < 4; ++i) st.prevQ[i] = q[i];
+        st.out[0] = st.out[1] = st.out[2] = 0.f;
+        return;
+    }
+
+    const uint16_t dticks = static_cast<uint16_t>((ts12 - st.prevTs) & 0x0FFFu);
+    if (dticks == 0 || dticks > 400) {
+        if (dticks > 400) {
+            st.prevTs = ts12;
+            for (int i = 0; i < 4; ++i) st.prevQ[i] = q[i];
+            st.out[0] = st.out[1] = st.out[2] = 0.f;
+        } else {
+            outDps[0] = st.out[0]; outDps[1] = st.out[1]; outDps[2] = st.out[2];
+        }
+        return;
+    }
+
+    const float dt = static_cast<float>(dticks) / 800.0f;
+    const float dot = st.prevQ[0]*q[0] + st.prevQ[1]*q[1] + st.prevQ[2]*q[2] + st.prevQ[3]*q[3];
+    if (dot < 0.0f) { for (int i = 0; i < 4; ++i) q[i] = -q[i]; }
+
+
+    const float pw = st.prevQ[0], px = -st.prevQ[1], py = -st.prevQ[2], pz = -st.prevQ[3];
+    const float dw = pw*q[0] - px*q[1] - py*q[2] - pz*q[3];
+    const float dx = pw*q[1] + px*q[0] + py*q[3] - pz*q[2];
+    const float dy = pw*q[2] - px*q[3] + py*q[0] + pz*q[1];
+    const float dz = pw*q[3] + px*q[2] - py*q[1] + pz*q[0];
+
+    st.prevTs = ts12;
+    for (int i = 0; i < 4; ++i) st.prevQ[i] = q[i];
+
+    float wx = 0.f, wy = 0.f, wz = 0.f;
+    const float vn = std::sqrt(dx*dx + dy*dy + dz*dz);
+    if (vn > 1e-7f) {
+        const float ang = 2.0f * std::atan2(vn, std::clamp(dw, -1.0f, 1.0f));
+        const float k = (ang / (dt * vn)) * 57.2957795f;
+        wx = dx * k;
+        wy = dy * k;
+        wz = dz * k;
+    }
+
+
+    const float raw[3] = { wx, wz, -wy };
+    constexpr float kDeadzoneDps = 0.6f;
+    constexpr float kAlpha = 0.85f;
+    for (int i = 0; i < 3; ++i) {
+        float v = raw[i];
+        v = (v > kDeadzoneDps) ? (v - kDeadzoneDps) : (v < -kDeadzoneDps) ? (v + kDeadzoneDps) : 0.f;
+        st.out[i] += kAlpha * (v - st.out[i]);
+        outDps[i] = st.out[i];
+    }
+}
+
+
+
+
+
+
+static void ConsoleToGenuine(std::vector<uint8_t>& buf, bool isLeft, FauxGyroState* fg = nullptr)
+{
+    std::vector<uint8_t> g(63, 0);
+
+    const size_t otherOff = isLeft ? 13 : 10;
+    g[otherOff] = 0x00; g[otherOff + 1] = 0x08; g[otherOff + 2] = 0x80;
+
+    if (buf.size() >= 8) {
+        const uint16_t nb = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
+        auto has = [&](int bit) { return ((nb >> bit) & 1) != 0; };
+
+        const size_t stickOff = isLeft ? 10 : 13;
+        g[stickOff] = buf[5]; g[stickOff + 1] = buf[6]; g[stickOff + 2] = buf[7];
+
+        if (isLeft) {
+            uint8_t b5 = 0, b6 = 0;
+            if (has(0))  b6 |= 0x01;
+            if (has(3))  b6 |= 0x02;
+            if (has(1))  b6 |= 0x04;
+            if (has(2))  b6 |= 0x08;
+            if (has(14)) b6 |= 0x10;
+            if (has(15)) b6 |= 0x20;
+            if (has(4))  b6 |= 0x40;
+            if (has(5))  b6 |= 0x80;
+            if (has(6))  b5 |= 0x01;
+            if (has(7))  b5 |= 0x08;
+            if (has(8))  b5 |= 0x20;
+            g[5] = b5; g[6] = b6;
+        } else {
+            uint8_t b4 = 0, b5 = 0;
+            if (has(2))  b4 |= 0x01;
+            if (has(3))  b4 |= 0x02;
+            if (has(0))  b4 |= 0x04;
+            if (has(1))  b4 |= 0x08;
+            if (has(14)) b4 |= 0x10;
+            if (has(15)) b4 |= 0x20;
+            if (has(4))  b4 |= 0x40;
+            if (has(5))  b4 |= 0x80;
+            if (has(6))  b5 |= 0x02;
+            if (has(7))  b5 |= 0x04;
+            if (has(8))  b5 |= 0x10;
+            if (has(12)) b5 |= 0x40;
+            g[4] = b4; g[5] = b5;
+        }
+        g[0] = buf[0]; g[1] = buf[1];
+    }
+
+
+
+    if (fg && g_fg.enabled.load()) {
+        const size_t base = isLeft ? 0x0F : 0x10;
+        if (buf.size() >= base + 0x1C && buf[base - 1] >= 0x1C) {
+            auto rd16 = [&](size_t o) { return static_cast<int>(static_cast<int16_t>(buf[o] | (buf[o + 1] << 8))); };
+            const int rx = rd16(base + 0x12);
+            const int ry = rd16(base + 0x16);
+            const int rz = rd16(base + 0x1A);
+
+            float w[3] = { 0.f, 0.f, 0.f };
+            M12ProQuatToGyro(*fg, buf, base, w);
+
+            const float gain = static_cast<float>(g_fg.gainPercent.load()) / 100.0f;
+            const float sx = g_fg.invX.load() ? -1.f : 1.f;
+            const float sy = g_fg.invY.load() ? -1.f : 1.f;
+            const float sz = g_fg.invZ.load() ? -1.f : 1.f;
+            auto put16 = [&](size_t o, int v) {
+                v = std::max(-32768, std::min(32767, v));
+                g[o]     = static_cast<uint8_t>(v & 0xFF);
+                g[o + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+            };
+            g[0x29] = 0x01;
+            put16(0x30, rx);
+            put16(0x32, rz);
+            put16(0x34, -ry);
+
+            put16(0x36, static_cast<int>(std::lround(w[0] * sx * gain * 133.333f)));
+            put16(0x38, static_cast<int>(std::lround(w[1] * sy * gain * 133.333f)));
+            put16(0x3A, static_cast<int>(std::lround(w[2] * sz * gain * 133.333f)));
+        }
+    }
+    buf.swap(g);
+}
+
 static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroMode, uint8_t dsuSlot) {
     player.joycon.inputChar.ValueChanged(
         [&player, gyroMode, dsuSlot]
@@ -1049,6 +1892,7 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
         auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
         rdr.ReadBytes(buf);
+        if (player.joycon.consoleMode) ConsoleToGenuine(buf, player.side == JoyConSide::Left, player.joycon.fg.get());
 
         FeedCalibBuffer(buf, player.side == JoyConSide::Left);
 
@@ -1198,6 +2042,75 @@ static void HelpMarker(const char* txt) {
     if (ImGui::IsItemHovered()) { ImGui::BeginTooltip(); ImGui::TextUnformatted(txt); ImGui::EndTooltip(); }
 }
 
+static const char* FAUX_GYRO_FILE = "joycon2cpp_fauxgyro.cfg";
+
+static void SaveFauxGyroConfig() {
+    std::ofstream f(FAUX_GYRO_FILE);
+    if (!f.is_open()) return;
+    f << "enabled=" << (g_fg.enabled.load() ? 1 : 0) << "\n"
+      << "invx="    << (g_fg.invX.load() ? 1 : 0) << "\n"
+      << "invy="    << (g_fg.invY.load() ? 1 : 0) << "\n"
+      << "invz="    << (g_fg.invZ.load() ? 1 : 0) << "\n"
+      << "gain="    << g_fg.gainPercent.load() << "\n"
+      << "dual="    << g_fg.dualSource.load() << "\n";
+}
+
+static void LoadFauxGyroConfig() {
+    std::ifstream f(FAUX_GYRO_FILE);
+    if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto p = line.find('=');
+        if (p == std::string::npos) continue;
+        const std::string key = line.substr(0, p);
+        const int val = std::atoi(line.c_str() + p + 1);
+        if      (key == "enabled") g_fg.enabled.store(val != 0);
+        else if (key == "invx")    g_fg.invX.store(val != 0);
+        else if (key == "invy")    g_fg.invY.store(val != 0);
+        else if (key == "invz")    g_fg.invZ.store(val != 0);
+        else if (key == "gain")    g_fg.gainPercent.store(std::max(25, std::min(300, val)));
+        else if (key == "dual")    g_fg.dualSource.store(std::max(0, std::min(2, val)));
+    }
+}
+
+
+
+static void DrawFauxGyroControls() {
+    bool on = g_fg.enabled.load();
+    if (ImGui::Checkbox("Hardware IMU gyro (M12 Pro quaternion + accel)", &on)) {
+        g_fg.enabled.store(on);
+        SaveFauxGyroConfig();
+    }
+    ImGui::SameLine();
+    HelpMarker("Decodes the M12 Pro's hardware 3D orientation quaternion (including full yaw) into 3-axis gyro + aligned accel.\n"
+               "Feeds both Steam (DS4 gyro) and the DSU server (X = Pitch, Y = Yaw, Z = Roll).");
+    if (!on) return;
+
+    ImGui::Indent(10);
+    bool ix = g_fg.invX.load(), iy = g_fg.invY.load(), iz = g_fg.invZ.load();
+    bool changed = false;
+    changed |= ImGui::Checkbox("Invert Pitch (X)##fg", &ix); ImGui::SameLine();
+    changed |= ImGui::Checkbox("Invert Yaw (Y)##fg", &iy); ImGui::SameLine();
+    changed |= ImGui::Checkbox("Invert Roll (Z)##fg", &iz);
+    ImGui::SameLine(); HelpMarker("If an axis moves the wrong way in a game, invert it here. Takes effect immediately.");
+
+    int gp = g_fg.gainPercent.load();
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::SliderInt("Strength %##fg", &gp, 25, 300)) { g_fg.gainPercent.store(gp); changed = true; }
+
+    const char* srcs[] = { "Both pads", "Right pad", "Left pad" };
+    int ds = g_fg.dualSource.load();
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::Combo("Dual JoyCon gyro from##fg", &ds, srcs, 3)) { g_fg.dualSource.store(ds); changed = true; }
+    ImGui::SameLine(); HelpMarker("Which pad of a Dual JoyCon player supplies gyro. Applied when you connect.");
+
+    if (changed) {
+        g_fg.invX.store(ix); g_fg.invY.store(iy); g_fg.invZ.store(iz);
+        SaveFauxGyroConfig();
+    }
+    ImGui::Unindent(10);
+}
+
 static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
     ImGui::PushID(i);
     ImGui::TableNextRow();
@@ -1231,31 +2144,12 @@ static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
     } else ImGui::TextDisabled("—");
 
     ImGui::TableSetColumnIndex(4);
-    if (cfg.controllerType == DualJoyCon) {
-        const char* gs[] = {"Both","Left","Right"};
-        int g = (cfg.gyroSource==GyroSource::Both)?0:(cfg.gyroSource==GyroSource::Left)?1:2;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##gyrosrc", &g, gs, 3))
-            cfg.gyroSource = g==0?GyroSource::Both:g==1?GyroSource::Left:GyroSource::Right;
-    } else ImGui::TextDisabled("—");
-
-    ImGui::TableSetColumnIndex(5);
-    if (cfg.controllerType != NSOGCController) {
-        const char* gm[] = {"Raw","DSU UDP"};
-        int gv = (cfg.gyroMode==GyroMode::Raw)?0:1;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##gyromode", &gv, gm, 2)) {
-            cfg.gyroMode = gv==0?GyroMode::Raw:GyroMode::DsuUdp;
-        }
-    } else ImGui::TextDisabled("—");
-
-    ImGui::TableSetColumnIndex(6);
     if (cfg.controllerType == SingleJoyCon) {
         ImGui::SetNextItemWidth(-1);
         ImGui::Checkbox("##mouse", &cfg.mouseEnabled);
     } else ImGui::TextDisabled("—");
 
-    ImGui::TableSetColumnIndex(7);
+    ImGui::TableSetColumnIndex(5);
     const bool leftJoyConDpadApplies =
         (cfg.controllerType == SingleJoyCon && cfg.joyconSide == JoyConSide::Left);
     if (leftJoyConDpadApplies) {
@@ -1267,7 +2161,7 @@ static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
     } else ImGui::TextDisabled("—");
 
 
-    ImGui::TableSetColumnIndex(8);
+    ImGui::TableSetColumnIndex(6);
     const bool remapApplies = (cfg.controllerType == SingleJoyCon) &&
         (cfg.joyconOrientation == JoyConOrientation::Sideways);
     if (remapApplies) {
@@ -1294,14 +2188,12 @@ static void DrawSetupScreen() {
 
     if (ImGui::CollapsingHeader("Players", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Spacing();
-        if (ImGui::BeginTable("players", 9,
+        if (ImGui::BeginTable("players", 7,
             ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("Player",       ImGuiTableColumnFlags_WidthFixed, 60);
             ImGui::TableSetupColumn("Type",         ImGuiTableColumnFlags_WidthStretch, 1.4f);
             ImGui::TableSetupColumn("Side",         ImGuiTableColumnFlags_WidthStretch, 0.8f);
             ImGui::TableSetupColumn("Orientation",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
-            ImGui::TableSetupColumn("Gyro Source",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
-            ImGui::TableSetupColumn("Gyro Output",  ImGuiTableColumnFlags_WidthStretch, 1.2f);
             ImGui::TableSetupColumn("Mouse",        ImGuiTableColumnFlags_WidthStretch, 0.7f);
             ImGui::TableSetupColumn("D-Pad",        ImGuiTableColumnFlags_WidthStretch, 1.1f);
             ImGui::TableSetupColumn("Remap",        ImGuiTableColumnFlags_WidthStretch, 0.9f);
@@ -1320,6 +2212,9 @@ static void DrawSetupScreen() {
             g_playerConfigs.pop_back();
         ImGui::Spacing();
     }
+
+    DrawFauxGyroControls();
+    ImGui::Spacing();
 
     if (ImGui::CollapsingHeader("Settings")) {
         ImGui::Spacing();
@@ -1457,6 +2352,15 @@ static void DrawSetupScreen() {
         g_connectionError     = "";
         g_screen = AppScreen::Connecting;
 
+
+        for (auto& pc : g_playerConfigs) {
+            if (pc.controllerType == NSOGCController) continue;
+            pc.gyroMode = g_fg.enabled.load() ? GyroMode::DsuUdp : GyroMode::Raw;
+            const int ds = g_fg.dualSource.load();
+            pc.gyroSource = (ds == 0) ? GyroSource::Both : (ds == 1) ? GyroSource::Right : GyroSource::Left;
+        }
+        SaveFauxGyroConfig();
+
         InitViGEm();
         bool needsDsu = false;
         for (auto& pc : g_playerConfigs) if (pc.gyroMode==GyroMode::DsuUdp) { needsDsu=true; break; }
@@ -1478,17 +2382,21 @@ static void DrawSetupScreen() {
             g_dualRumbleCtxs.clear();
             g_proRumbleCtxs.clear();
 
+            ClearConnectedAddrs();
+            { std::lock_guard<std::mutex> lk(g_rxStatsMutex); g_rxStats.clear(); }
+            DiagLog("---- connecting " + std::to_string(configs.size()) + " player(s) ----");
+
             int dsuSlot = 0;
             for (int pi = 0; pi < (int)configs.size(); ++pi) {
                 auto& pc = configs[pi];
 
                 if (pc.controllerType == SingleJoyCon) {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    SetTaskStatus(taskIdx, "Scanning...");
                     bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok, pc.joyconSide);
+                    auto cj = BleConnect([&](const std::string& s){ SetTaskStatus(taskIdx, s); }, ok, pc.joyconSide,
+                                         pc.joyconSide == JoyConSide::Left ? DeviceKind::JoyConL : DeviceKind::JoyConR);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
                     auto t = AddDS4();
                     auto sp = std::make_unique<SingleJoyConPlayer>();
                     sp->joycon = cj;
@@ -1512,20 +2420,18 @@ static void DrawSetupScreen() {
                     ++taskIdx; ++dsuSlot;
 
                 } else if (pc.controllerType == DualJoyCon) {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    SetTaskStatus(taskIdx, "Scanning...");
                     bool okR = false;
-                    auto rjc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okR, JoyConSide::Right);
+                    auto rjc = BleConnect([&](const std::string& s){ SetTaskStatus(taskIdx, s); }, okR, JoyConSide::Right, DeviceKind::JoyConR);
                     if (!okR) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (rjc.rumbleChar) { SendJoyCon2OfficialInit(rjc.rumbleChar); }
                     ++taskIdx;
 
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    SetTaskStatus(taskIdx, "Scanning...");
                     bool okL = false;
-                    auto ljc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okL, JoyConSide::Left);
+                    auto ljc = BleConnect([&](const std::string& s){ SetTaskStatus(taskIdx, s); }, okL, JoyConSide::Left, DeviceKind::JoyConL);
                     if (!okL) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (ljc.rumbleChar) { SendJoyCon2OfficialInit(ljc.rumbleChar); }
                     ++taskIdx;
 
                     auto dp = std::make_unique<DualJoyConPlayer>();
@@ -1536,10 +2442,11 @@ static void DrawSetupScreen() {
                     dp->sharedState=std::make_shared<DualJoyConSharedState>();
                     if (dp->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
                     auto ss=dp->sharedState;
-                    ljc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
+                    ljc.inputChar.ValueChanged([ss, cm = ljc.consoleMode, fg = ljc.fg](GattCharacteristic const&, GattValueChangedEventArgs const& a){
                         if (g_shuttingDown.load()) return;
                         auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
+                        if (cm) ConsoleToGenuine(buf, true, fg.get());
                         FeedCalibBuffer(buf, true);
                         std::lock_guard<std::mutex> lk(ss->mutex);
                         ss->left.bleDeltaMs=MsBetween(ss->lastLeftBleTime,now); ss->lastLeftBleTime=now;
@@ -1547,10 +2454,11 @@ static void DrawSetupScreen() {
                         ss->cv.notify_one();
                     });
                     ljc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-                    rjc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
+                    rjc.inputChar.ValueChanged([ss, cm = rjc.consoleMode, fg = rjc.fg](GattCharacteristic const&, GattValueChangedEventArgs const& a){
                         if (g_shuttingDown.load()) return;
                         auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
+                        if (cm) ConsoleToGenuine(buf, false, fg.get());
                         FeedCalibBuffer(buf, false);
                         std::lock_guard<std::mutex> lk(ss->mutex);
                         ss->right.bleDeltaMs=MsBetween(ss->lastRightBleTime,now); ss->lastRightBleTime=now;
@@ -1560,13 +2468,14 @@ static void DrawSetupScreen() {
                     rjc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
                     dp->updateThread=std::thread([dpptr=dp.get(),ss](){
                         uint64_t lastSeq=0;
+                        uint64_t lastDsuLeftSeq=0, lastDsuRightSeq=0;
                         while (dpptr->running.load(std::memory_order_acquire) && !g_shuttingDown.load()) {
                             TimedInputBuffer ls,rs;
                             {
                                 std::unique_lock<std::mutex> lk(ss->mutex);
                                 ss->cv.wait_for(lk,std::chrono::milliseconds(1),[&]{ return !dpptr->running.load()||ss->sequence!=lastSeq; });
                                 if (!dpptr->running.load()) break;
-                                if (ss->left.buffer.empty()||ss->right.buffer.empty()||ss->sequence==lastSeq) continue;
+                                if ((ss->left.buffer.empty()&&ss->right.buffer.empty())||ss->sequence==lastSeq) continue;
                                 auto now=SteadyClock::now();
                                 if (!ShouldEmit(g_opts.updatePolicy,ss->lastEmitTime,now)){lastSeq=ss->sequence;continue;}
                                 ls=ss->left; rs=ss->right; lastSeq=ss->sequence;
@@ -1574,7 +2483,17 @@ static void DrawSetupScreen() {
                             auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,dpptr->leftDpadMode);
                             if (g_opts.swapABXY) ApplySwapABXY(report);
                             if (dpptr->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
-                                g_dsuServer.UpdateController(dpptr->dsuSlot,report);
+                                const bool leftNew  = (ls.sequence != 0 && ls.sequence != lastDsuLeftSeq);
+                                const bool rightNew = (rs.sequence != 0 && rs.sequence != lastDsuRightSeq);
+                                const bool pushDsu =
+                                    (dpptr->gyroSource == GyroSource::Right && rightNew) ||
+                                    (dpptr->gyroSource == GyroSource::Left  && leftNew)  ||
+                                    (dpptr->gyroSource == GyroSource::Both  && (leftNew || rightNew));
+                                if (pushDsu) {
+                                    lastDsuLeftSeq  = ls.sequence;
+                                    lastDsuRightSeq = rs.sequence;
+                                    g_dsuServer.UpdateController(dpptr->dsuSlot,report);
+                                }
                             }
                             if (g_shuttingDown.load() || !g_vigem || !dpptr->ds4Controller) break;
                             vigem_target_ds4_update_ex(g_vigem,dpptr->ds4Controller,report);
@@ -1590,12 +2509,11 @@ static void DrawSetupScreen() {
                     ++dsuSlot;
 
                 } else if (pc.controllerType == ProController) {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    SetTaskStatus(taskIdx, "Scanning...");
                     bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok, JoyConSide::Right);
+                    auto cj = BleConnect([&](const std::string& s){ SetTaskStatus(taskIdx, s); }, ok, JoyConSide::Right, DeviceKind::Pro);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.rumbleChar) { SendProCon2OfficialInit(cj.rumbleChar); }
                     auto tgt=AddDS4();
                     auto latPtr=std::make_shared<LatencyTracker>();
                     auto gm=pc.gyroMode; uint8_t ds=(uint8_t)dsuSlot;
@@ -1613,7 +2531,6 @@ static void DrawSetupScreen() {
                             ApplyGLGR(report,buf); g_dsuServer.UpdateController(ds,report);
                         }
                         if (g_shuttingDown.load() || !g_vigem || !tgt) return;
-                        if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         vigem_target_ds4_update_ex(g_vigem,tgt,report);
                     });
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
@@ -1628,12 +2545,11 @@ static void DrawSetupScreen() {
                     ++taskIdx; ++dsuSlot;
 
                 } else {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    SetTaskStatus(taskIdx, "Scanning...");
                     bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
+                    auto cj = BleConnect([&](const std::string& s){ SetTaskStatus(taskIdx, s); }, ok, JoyConSide::Left, DeviceKind::GC);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.rumbleChar) { SendNSOGCOfficialInit(cj.rumbleChar); }
                     auto tgt=AddDS4();
                     cj.inputChar.ValueChanged([tgt](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
                         if (g_shuttingDown.load()) return;
@@ -1641,7 +2557,6 @@ static void DrawSetupScreen() {
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         DS4_REPORT_EX report=GenerateNSOGCReport(buf);
                         if (g_opts.swapABXY) ApplySwapABXY(report);
-                        if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         vigem_target_ds4_update_ex(g_vigem,tgt,report);
                     });
@@ -1683,12 +2598,29 @@ static void DrawConnectingScreen() {
             if (t.done) {
                 ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "[OK] %s", t.label.c_str());
             } else {
+                std::string status;
+                { std::lock_guard<std::mutex> lk(g_connMutex); status = t.statusMsg; }
                 static float spin = 0.f; spin += ImGui::GetIO().DeltaTime * 3.f;
                 const char* spinners[] = {"|","/","-","\\"};
                 ImGui::TextColored({1.f,0.8f,0.2f,1.f}, "[%s] %s — %s",
-                    spinners[(int)(spin)%4], t.label.c_str(), t.statusMsg.c_str());
+                    spinners[(int)(spin)%4], t.label.c_str(), status.c_str());
                 break;
             }
+        }
+
+
+        ImGui::Spacing(); ImGui::Separator();
+        ImGui::TextDisabled("Connection log (also saved to joycon2cpp_debug.log)");
+        {
+            std::vector<std::string> tail;
+            {
+                std::lock_guard<std::mutex> lk(g_logMutex);
+                size_t start = g_logLines.size() > 14 ? g_logLines.size() - 14 : 0;
+                tail.assign(g_logLines.begin() + start, g_logLines.end());
+            }
+            ImGui::BeginChild("##connlog", ImVec2(-FLT_MIN, 0), true);
+            for (auto& l : tail) ImGui::TextWrapped("%s", l.c_str());
+            ImGui::EndChild();
         }
 
         ImGui::Spacing();
@@ -1871,6 +2803,43 @@ static void DrawRunningScreen() {
         ImGui::Unindent(10); ImGui::Spacing();
     }
 
+    if (ImGui::CollapsingHeader("Hardware IMU Gyro", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Indent(10);
+        DrawFauxGyroControls();
+        ImGui::Unindent(10); ImGui::Spacing();
+    }
+
+    if (ImGui::CollapsingHeader("Live Input Monitor", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Indent(10);
+        ImGui::TextDisabled("Every notify characteristic of each pad. Press buttons / move sticks and watch which line changes.");
+        if (!g_capActive.load()) {
+            if (ImGui::Button("Record 20 s motion capture")) CapStart(20);
+            ImGui::SameLine();
+            ImGui::TextDisabled("saves joycon2cpp_motion_capture.txt");
+        } else {
+            ImGui::TextColored({1.f,0.8f,0.2f,1.f}, "Recording... %d s left. Hold BOTH pads still for 4 s, then rotate each slowly around every axis.",
+                               g_capSecondsLeft.load());
+        }
+        std::vector<std::shared_ptr<RxStats>> statsCopy;
+        { std::lock_guard<std::mutex> lk(g_rxStatsMutex); statsCopy = g_rxStats; }
+        if (statsCopy.empty()) ImGui::TextColored({1.f,0.6f,0.2f,1.f}, "No controllers registered.");
+        for (auto& st : statsCopy) {
+            std::vector<uint8_t> pkt;
+            { std::lock_guard<std::mutex> lk(st->mtx); pkt = st->lastPacket; }
+            const uint64_t cnt = st->count.load();
+            ImVec4 col = cnt > 0 ? ImVec4(0.3f,1.f,0.3f,1.f) : ImVec4(1.f,0.35f,0.35f,1.f);
+            ImGui::TextColored(col, "%s: %llu packets, last length %u bytes", st->label.c_str(),
+                               (unsigned long long)cnt, (unsigned)st->lastLen.load());
+            if (!pkt.empty()) {
+                std::vector<uint8_t> head(pkt.begin(), pkt.begin() + (std::ptrdiff_t)std::min<size_t>(pkt.size(), 20));
+                ImGui::TextDisabled("  %s", HexBytes(head).c_str());
+            } else {
+                ImGui::TextDisabled("  (no packets received - see joycon2cpp_debug.log)");
+            }
+        }
+        ImGui::Unindent(10); ImGui::Spacing();
+    }
+
     if (ImGui::CollapsingHeader("Stick Calibration")) {
         ImGui::Indent(10);
         ImGui::TextDisabled("Connect a JoyCon first, then calibrate below.");
@@ -1932,9 +2901,9 @@ static void DrawRunningScreen() {
     if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen))
     {
         static std::string logBuffer;
-        static size_t lastLogCount = 0;
+        static uint64_t lastLogVersion = (uint64_t)-1;
     
-        if (lastLogCount != g_logLines.size())
+        if (lastLogVersion != g_logVersion.load())
         {
             std::lock_guard<std::mutex> lk(g_logMutex);
     
@@ -1946,7 +2915,7 @@ static void DrawRunningScreen() {
                 logBuffer += "\r\n";
             }
     
-            lastLogCount = g_logLines.size();
+            lastLogVersion = g_logVersion.load();
         }
     
         if (ImGui::Button("Copy Log"))
@@ -1974,6 +2943,7 @@ static void DrawRunningScreen() {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     init_apartment();
     LoadProConfig();
+    LoadFauxGyroConfig();
     LoadCalibrationProfiles("calibration.json");
 
     if (g_playerConfigs.empty()) g_playerConfigs.push_back({});
@@ -2045,7 +3015,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     for (auto* p : g_singleRumbleCtxs) delete p;
     for (auto* p : g_dualRumbleCtxs)   delete p;
-    for (auto* p : g_proRumbleCtxs)    delete p;
+    for (auto* p : g_proRumbleCtxs)     delete p;
     g_singleRumbleCtxs.clear();
     g_dualRumbleCtxs.clear();
     g_proRumbleCtxs.clear();

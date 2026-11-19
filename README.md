@@ -1,4 +1,35 @@
-# joycon2cpp
+# joycon2cpp — Mobapad M12 Pro support
+
+This repository is a modified fork of [TheFrano/joycon2cpp](https://github.com/TheFrano/joycon2cpp).
+
+**Fork maintainer:** [@DarkEslariate](https://github.com/DarkEslariate)
+
+This fork adds support for the **Mobapad M12 Pro** while retaining the original project's Switch 2 Joy-Con functionality. The goal is to let the M12 Pro connect to a Windows PC through the same application and use the same virtual-controller output features.
+
+## Mobapad M12 Pro support
+
+The Mobapad-specific changes add support for the controller's alternate BLE communication behavior. In particular, this fork:
+
+- Detects and connects to the M12 Pro's console-style BLE input path.
+- Enables the controller's session and subscribes to its side-specific native input characteristic.
+- Converts the M12 Pro's input reports into the format used by the existing controller input pipeline.
+- Supports the controller's button and stick inputs.
+- Retains rumble support through the controller's vibration characteristics.
+- Converts the M12 Pro's IMU quaternion data into gyro data for the existing motion-input pipeline.
+
+The original Switch 2 Joy-Con support and application features are intended to remain available, including regular controller inputs, rumble, and gyro. The Mobapad-specific motion handling is implemented as an additional path rather than a replacement for the original Joy-Con handling.
+
+See [MOBAPAD_CHANGES.md](MOBAPAD_CHANGES.md) for a more focused description of the changes.
+
+## Attribution and license
+
+This project is based on and derived from [TheFrano/joycon2cpp](https://github.com/TheFrano/joycon2cpp). The original project and its MIT license are retained. The original author's copyright and license notice remain in `LICENSE`; modifications in this fork are attributed to Dark Eslariate.
+
+This is an independent community modification. It is not affiliated with, endorsed by, or sponsored by Mobapad or Nintendo.
+
+---
+
+## Original project overview
 
 A C++ executable that makes Switch 2 controllers into working PC controllers.
 
@@ -51,24 +82,30 @@ Make sure the following are installed via Visual Studio Installer:
 
  (Optional but useful) C++/WinRT  
 
-1. Open the x64 Native Tools Command Prompt for VS (whatever your version is)
+1. Open the **x64 Native Tools Command Prompt for VS** (or a Developer PowerShell with the x64 tools).
 
-2. Go into the project's root directory and make a build folder:
-
+2. Go into the project's root directory (the folder that contains `testapp`, `README.md`, ...):
    ```sh
    cd (path to the main directory of the project here)
-   mkdir build
-   cd build
+   ```
 
-3. Generate Visual Studio project files with CMake:
-    ```sh
-    cmake .. -G "Visual Studio 17 2022" -A x64
+3. Generate the Visual Studio project from the `testapp` folder (that is where `CMakeLists.txt` lives):
+   ```sh
+   cmake -S testapp -B build -G "Visual Studio 17 2022" -A x64
+   ```
+   (Different Visual Studio version? Run `cmake --help` and use the "Visual Studio ..." generator it lists.)
+
 4. Build the project in Release mode:
-    ```sh
-    cmake --build . --config Release
+   ```sh
+   cmake --build build --config Release
+   ```
+
 5. The compiled executable will be located in:
-    ```sh
-    build\Release\testapp.exe
+   ```sh
+   build\Release\testapp.exe
+   ```
+
+Run it from a folder you can write to - it creates `joycon2cpp_config.json`, `calibration.json` and `joycon2cpp_debug.log` next to where you start it.
 
 --- 
 

@@ -448,7 +448,9 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
 
-    if (buffer.size() < 0x3C) return report;
+
+
+    if (buffer.size() < 7) return report;
 
     bool isLeft = (side == JoyConSide::Left);
     bool upright = (orientation == JoyConOrientation::Upright);
@@ -539,14 +541,19 @@ DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
 
-    if (leftBuffer.size() < 0x3C && rightBuffer.size() < 0x3C) return report;
+
+    const bool haveLeft  = leftBuffer.size()  >= 7;
+    const bool haveRight = rightBuffer.size() >= 6;
+    if (!haveLeft && !haveRight) return report;
 
     DS4_REPORT_EX leftReport{};
-    if (leftBuffer.size() >= 0x3C)
+    DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&leftReport.Report));
+    if (haveLeft)
         leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright, leftDpadMode);
 
     DS4_REPORT_EX rightReport{};
-    if (rightBuffer.size() >= 0x3C)
+    DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&rightReport.Report));
+    if (haveRight)
         rightReport = GenerateDS4Report(rightBuffer, JoyConSide::Right, JoyConOrientation::Upright);
 
     USHORT leftDpad           = leftReport.Report.wButtons & 0xF;
@@ -567,8 +574,8 @@ DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer
     report.Report.sCurrentTouch.bTouchData2[1] = ((x2 >> 8) & 0x0F) | ((y2 & 0x0F) << 4);
     report.Report.sCurrentTouch.bTouchData2[2] = (y2 >> 4) & 0xFF;
 
-    uint32_t leftState  = (leftBuffer[4]  << 16) | (leftBuffer[5]  << 8) | leftBuffer[6];
-    uint32_t rightState = (rightBuffer[3] << 16) | (rightBuffer[4] << 8) | rightBuffer[5];
+    uint32_t leftState  = haveLeft  ? ((leftBuffer[4]  << 16) | (leftBuffer[5]  << 8) | leftBuffer[6])  : 0;
+    uint32_t rightState = haveRight ? ((rightBuffer[3] << 16) | (rightBuffer[4] << 8) | rightBuffer[5]) : 0;
 
     BYTE lt = 0, rt = 0;
     bool ls = false, rs = false;
@@ -648,7 +655,7 @@ DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer)
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
 
-    if (buffer.size() < 0x3C) return report;
+    if (buffer.size() < 16) return report;
 
     uint64_t state = 0;
     for (int i = 3; i <= 8; ++i) state = (state << 8) | buffer[i];
@@ -706,7 +713,7 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
 
-    if (buffer.size() < 0x3C) return report;
+    if (buffer.size() < 16) return report;
 
     uint64_t state = 0;
     for (int i = 3; i <= 8; ++i) state = (state << 8) | buffer[i];
@@ -742,8 +749,8 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
 
     DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), static_cast<DS4_DPAD_DIRECTIONS>(dpad));
 
-    report.Report.bTriggerL = buffer[0x3c];
-    report.Report.bTriggerR = buffer[0x3d];
+    report.Report.bTriggerL = buffer.size() > 0x3D ? buffer[0x3c] : 0;
+    report.Report.bTriggerR = buffer.size() > 0x3D ? buffer[0x3d] : 0;
 
     const auto& cal = GetActiveCalibration();
     auto [lx, ly] = decode_calibrated_stick(&buffer[10], cal.leftStick);
