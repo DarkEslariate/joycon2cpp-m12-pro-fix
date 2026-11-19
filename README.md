@@ -1,4 +1,4 @@
-# joycon2cpp — Mobapad M12 Pro support
+# joycon2cpp - Mobapad M12 Pro support
 
 This repository is a modified fork of [TheFrano/joycon2cpp](https://github.com/TheFrano/joycon2cpp).
 
