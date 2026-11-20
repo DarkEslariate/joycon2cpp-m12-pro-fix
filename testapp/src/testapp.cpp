@@ -169,6 +169,8 @@ struct FauxGyroState {
     uint16_t   prevTs = 0;
     float      prevQ[4] = { 1.f, 0.f, 0.f, 0.f };
     float      out[3] = { 0.f, 0.f, 0.f };
+    int32_t    mouseAccX = 0;
+    int32_t    mouseAccY = 0;
 };
 
 struct ConnectedJoyCon {
@@ -229,6 +231,7 @@ struct SingleJoyConPlayer {
     bool            wasChatPressed = false;
     int16_t         lastOpticalX   = 0, lastOpticalY = 0;
     bool            firstOpticalRead = true;
+    float           mouseRemX = 0.f, mouseRemY = 0.f;
     float           scrollAccumulator = 0.f;
     bool            mb4Pressed = false, mb5Pressed = false;
     bool            leftBtnPressed = false, rightBtnPressed = false, middleBtnPressed = false;
@@ -1847,7 +1850,24 @@ static void ConsoleToGenuine(std::vector<uint8_t>& buf, bool isLeft, FauxGyroSta
         g[0] = buf[0]; g[1] = buf[1];
     }
 
-
+    if (fg && buf.size() >= 0x0D) {
+        const int16_t mdx = static_cast<int16_t>(buf[0x09] | (buf[0x0A] << 8));
+        const int16_t mdy = static_cast<int16_t>(buf[0x0B] | (buf[0x0C] << 8));
+        int32_t ax = 0, ay = 0;
+        {
+            std::lock_guard<std::mutex> lk(fg->mtx);
+            fg->mouseAccX += mdx;
+            fg->mouseAccY += mdy;
+            ax = fg->mouseAccX;
+            ay = fg->mouseAccY;
+        }
+        const uint16_t ux = static_cast<uint16_t>(static_cast<uint32_t>(ax) & 0xFFFFu);
+        const uint16_t uy = static_cast<uint16_t>(static_cast<uint32_t>(ay) & 0xFFFFu);
+        g[0x10] = static_cast<uint8_t>(ux & 0xFF);
+        g[0x11] = static_cast<uint8_t>((ux >> 8) & 0xFF);
+        g[0x12] = static_cast<uint8_t>(uy & 0xFF);
+        g[0x13] = static_cast<uint8_t>((uy >> 8) & 0xFF);
+    }
 
     if (fg && g_fg.enabled.load()) {
         const size_t base = isLeft ? 0x0F : 0x10;
@@ -1914,13 +1934,22 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
 
             if (player.mouseMode > 0) {
                 auto [rx, ry] = GetRawOpticalMouse(buf);
-                if (player.firstOpticalRead) { player.lastOpticalX=rx; player.lastOpticalY=ry; player.firstOpticalRead=false; }
-                else {
+                if (player.firstOpticalRead) {
+                    player.lastOpticalX=rx; player.lastOpticalY=ry;
+                    player.mouseRemX=0.f; player.mouseRemY=0.f;
+                    player.firstOpticalRead=false;
+                } else {
                     int16_t dx=rx-player.lastOpticalX, dy=ry-player.lastOpticalY;
                     player.lastOpticalX=rx; player.lastOpticalY=ry;
-                    if (dx||dy) {
-                        float s = player.mouseMode==1?1.f:player.mouseMode==2?0.6f:0.3f;
-                        INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.dx=(int)(dx*s); ip.mi.dy=(int)(dy*s); ip.mi.dwFlags=MOUSEEVENTF_MOVE;
+                    float s = player.mouseMode==1?1.f:player.mouseMode==2?0.6f:0.3f;
+                    player.mouseRemX += dx * s;
+                    player.mouseRemY += dy * s;
+                    int mx = static_cast<int>(player.mouseRemX);
+                    int my = static_cast<int>(player.mouseRemY);
+                    player.mouseRemX -= mx;
+                    player.mouseRemY -= my;
+                    if (mx||my) {
+                        INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.dx=mx; ip.mi.dy=my; ip.mi.dwFlags=MOUSEEVENTF_MOVE;
                         SendInput(1,&ip,sizeof(ip));
                     }
                 }
@@ -1956,7 +1985,11 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
                 else if (sd.x<=BT) player.mb5Pressed=false;
                 buf[4]&=~0x40; buf[4]&=~0x80; buf[5]&=~0x04;
                 if (buf.size()>=16){buf[13]=0x00;buf[14]=0x08;buf[15]=0x80;}
-            } else player.firstOpticalRead=true;
+            } else {
+                player.firstOpticalRead=true;
+                player.mouseRemX=0.f;
+                player.mouseRemY=0.f;
+            }
         }
 
         if (!ShouldEmit(g_opts.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) return;
