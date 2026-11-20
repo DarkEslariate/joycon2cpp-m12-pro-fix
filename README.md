@@ -16,8 +16,9 @@ The Mobapad-specific changes add support for the controller's alternate BLE comm
 - Supports the controller's button and stick inputs.
 - Retains rumble support through the controller's vibration characteristics.
 - Converts the M12 Pro's IMU quaternion data into gyro data for the existing motion-input pipeline.
+- Retains mouse mode support for single joycon configurations (including left/right click and scroll wheel, as well as adjustable sensitivity via C button)
 
-The original Switch 2 Joy-Con support and application features are intended to remain available, including regular controller inputs, rumble, and gyro. The Mobapad-specific motion handling is implemented as an additional path rather than a replacement for the original Joy-Con handling.
+The original Switch 2 Joy-Con support and application features are intended to remain available, including regular controller inputs, rumble, gyro, and mouse mode. The Mobapad-specific motion handling is implemented as an additional path rather than a replacement for the original Joy-Con handling.
 
 See [MOBAPAD_CHANGES.md](MOBAPAD_CHANGES.md) for a more focused description of the changes.
 
